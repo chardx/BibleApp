@@ -14,7 +14,9 @@ class VoiceSettingsModal extends StatefulWidget {
 
 class _VoiceSettingsModalState extends State<VoiceSettingsModal> {
   late final TextEditingController _apiKeyController;
+  late final TextEditingController _bibleApiKeyController;
   bool _obscureApiKey = true;
+  bool _obscureBibleApiKey = true;
   String _activeTab = 'voice'; // 'voice', 'model', 'bible', 'api'
 
   static const List<String> translations = [
@@ -137,22 +139,26 @@ class _VoiceSettingsModalState extends State<VoiceSettingsModal> {
   void initState() {
     super.initState();
     _apiKeyController = TextEditingController(text: widget.controller.apiKey);
+    _bibleApiKeyController = TextEditingController(
+      text: widget.controller.bibleApiKey,
+    );
   }
 
   @override
   void dispose() {
     _apiKeyController.dispose();
+    _bibleApiKeyController.dispose();
     super.dispose();
   }
 
   void _saveApiKey() {
-    final key = _apiKeyController.text.trim();
-    widget.controller.setApiKey(key);
+    widget.controller.setApiKey(_apiKeyController.text.trim());
+    widget.controller.setBibleApiKey(_bibleApiKeyController.text.trim());
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
         backgroundColor: AppTheme.surfaceElevated,
         content: Text(
-          'Gemini API Key updated successfully',
+          'API keys updated',
           style: TextStyle(color: AppTheme.brightGold),
         ),
         duration: Duration(seconds: 2),
@@ -571,6 +577,15 @@ class _VoiceSettingsModalState extends State<VoiceSettingsModal> {
             letterSpacing: 1.1,
           ),
         ),
+        const SizedBox(height: 6),
+        Text(
+          'Verse cards show the licensed NIV text from API.Bible.',
+          style: GoogleFonts.plusJakartaSans(
+            color: AppTheme.textSecondary,
+            fontSize: 12,
+            height: 1.4,
+          ),
+        ),
         const SizedBox(height: 10),
         Wrap(
           spacing: 8,
@@ -695,7 +710,7 @@ class _VoiceSettingsModalState extends State<VoiceSettingsModal> {
         ),
         const SizedBox(height: 8),
         Text(
-          'A Google AI Studio API key enables low-latency bidirectional voice and Gemini TTS audio streaming directly on your device.',
+          'A Google AI Studio key runs the live voice session. An API.Bible key supplies the licensed NIV text shown on verse cards.',
           style: GoogleFonts.plusJakartaSans(
             color: AppTheme.textSecondary,
             fontSize: 12,
@@ -756,16 +771,87 @@ class _VoiceSettingsModalState extends State<VoiceSettingsModal> {
             ],
           ),
         ),
+        const SizedBox(height: 22),
+        Text(
+          'API.BIBLE KEY',
+          style: GoogleFonts.plusJakartaSans(
+            color: AppTheme.textMuted,
+            fontSize: 11,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 1.1,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'Used to fetch accurate New International Version passages from api.bible whenever a verse is cited.',
+          style: GoogleFonts.plusJakartaSans(
+            color: AppTheme.textSecondary,
+            fontSize: 12,
+            height: 1.4,
+          ),
+        ),
+        const SizedBox(height: 16),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+          decoration: BoxDecoration(
+            color: AppTheme.surfaceCard,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: controller.hasBibleApiKey
+                  ? AppTheme.livingGreen.withValues(alpha: 0.5)
+                  : AppTheme.primaryGold.withValues(alpha: 0.5),
+              width: 1.2,
+            ),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                Icons.menu_book_outlined,
+                color: controller.hasBibleApiKey
+                    ? AppTheme.livingGreen
+                    : AppTheme.brightGold,
+                size: 20,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: TextField(
+                  controller: _bibleApiKeyController,
+                  obscureText: _obscureBibleApiKey,
+                  style: GoogleFonts.plusJakartaSans(
+                    color: AppTheme.textPrimary,
+                    fontSize: 14,
+                  ),
+                  decoration: InputDecoration(
+                    hintText: 'API.Bible key',
+                    hintStyle: TextStyle(
+                      color: AppTheme.textMuted.withValues(alpha: 0.6),
+                    ),
+                    border: InputBorder.none,
+                  ),
+                ),
+              ),
+              IconButton(
+                icon: Icon(
+                  _obscureBibleApiKey ? Icons.visibility_off : Icons.visibility,
+                  color: AppTheme.textMuted,
+                  size: 20,
+                ),
+                onPressed: () => setState(
+                  () => _obscureBibleApiKey = !_obscureBibleApiKey,
+                ),
+              ),
+            ],
+          ),
+        ),
         const SizedBox(height: 16),
 
-        // Save Button
         SizedBox(
           width: double.infinity,
           height: 46,
           child: ElevatedButton.icon(
             icon: const Icon(Icons.check, size: 18),
             label: Text(
-              'Save & Activate Key',
+              'Save keys',
               style: GoogleFonts.plusJakartaSans(
                 fontWeight: FontWeight.w700,
                 fontSize: 14,

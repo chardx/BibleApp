@@ -5,14 +5,16 @@ class ScriptureQuote {
   final String? book;
   final int? chapter;
   final String? contextNote;
+  final String? copyright;
 
   const ScriptureQuote({
     required this.reference,
     required this.text,
-    this.translation = 'ESV',
+    this.translation = 'NIV',
     this.book,
     this.chapter,
     this.contextNote,
+    this.copyright,
   });
 
   Map<String, dynamic> toMap() {
@@ -23,6 +25,7 @@ class ScriptureQuote {
       'book': book,
       'chapter': chapter,
       'contextNote': contextNote,
+      'copyright': copyright,
     };
   }
 }

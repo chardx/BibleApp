@@ -5,8 +5,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/chat_message.dart';
 import '../models/scripture.dart';
 import '../services/audio_manager.dart';
+import '../services/bible_api_service.dart';
+import '../services/bible_reference.dart';
 import '../services/gemini_live_client.dart';
-import '../services/gemini_tts_service.dart';
 import '../services/scripture_parser.dart';
 
 enum VoiceSessionState {
@@ -26,19 +27,23 @@ class VoiceSessionController extends ChangeNotifier {
   double _audioAmplitude = 0.05;
 
   String _apiKey = '';
+  String _bibleApiKey = '';
   String _selectedVoice = 'Kore';
   String _selectedModel = 'models/gemini-2.0-flash-live-001';
-  String _selectedTranslation = 'ESV';
+  String _selectedTranslation = 'NIV';
   String _selectedPersona = 'Biblical Scholar & Exegete';
   String? _statusMessage = 'Tap microphone to speak';
+  String _heldAssistantText = '';
+  bool _voiceHasStarted = false;
 
   final List<ChatMessage> _messages = [];
   Timer? _amplitudeFallbackTimer;
 
   // Core Services
   late final AudioManager _audioManager;
+  late final BibleApiService _bibleApi;
   GeminiLiveClient? _liveClient;
-  GeminiTtsService? _ttsService;
+  String? _pendingLivePrompt;
 
   // Getters
   VoiceSessionState get state => _state;
@@ -46,6 +51,7 @@ class VoiceSessionController extends ChangeNotifier {
   bool get isSpeakerOn => _isSpeakerOn;
   double get audioAmplitude => _audioAmplitude;
   String get apiKey => _apiKey;
+  String get bibleApiKey => _bibleApiKey;
   String get selectedVoice => _selectedVoice;
   String get selectedModel => _selectedModel;
   String get selectedTranslation => _selectedTranslation;
@@ -53,6 +59,7 @@ class VoiceSessionController extends ChangeNotifier {
   String? get statusMessage => _statusMessage;
   List<ChatMessage> get messages => List.unmodifiable(_messages);
   bool get hasApiKey => _apiKey.trim().isNotEmpty;
+  bool get hasBibleApiKey => _bibleApiKey.trim().isNotEmpty;
 
   bool get isActive =>
       _state == VoiceSessionState.listening ||
@@ -62,6 +69,7 @@ class VoiceSessionController extends ChangeNotifier {
 
   VoiceSessionController() {
     _audioManager = AudioManager();
+    _bibleApi = BibleApiService();
     _setupAudioListeners();
     _loadPreferences();
     _initSampleConversation();
@@ -92,12 +100,14 @@ class VoiceSessionController extends ChangeNotifier {
       }
     };
 
-    // Playback finished
-    _audioManager.onPlaybackComplete = () {
+    // Playback finished — chat is already on screen; reopen the mic.
+    _audioManager.onPlaybackComplete = () async {
       if (_state == VoiceSessionState.speaking) {
+        await _finalizeCurrentAssistantTurn();
         _state = VoiceSessionState.listening;
         _statusMessage = 'Listening • Speak anytime to reply';
         _audioAmplitude = 0.05;
+        _resetAssistantHold();
         _audioManager.startRecording();
         notifyListeners();
       }
@@ -108,17 +118,19 @@ class VoiceSessionController extends ChangeNotifier {
     try {
       final prefs = await SharedPreferences.getInstance();
       _apiKey = prefs.getString('gemini_api_key') ?? '';
+      _bibleApiKey = prefs.getString('api_bible_key') ?? '';
+      _bibleApi.setApiKey(_bibleApiKey);
       _selectedVoice = prefs.getString('gemini_voice') ?? 'Kore';
       _selectedModel =
           prefs.getString('gemini_model') ?? 'models/gemini-2.0-flash-live-001';
-      _selectedTranslation = prefs.getString('bible_translation') ?? 'ESV';
+      _selectedTranslation = prefs.getString('bible_translation') ?? 'NIV';
       _selectedPersona =
           prefs.getString('voice_persona') ?? 'Biblical Scholar & Exegete';
 
-      if (_apiKey.isNotEmpty) {
-        _ttsService = GeminiTtsService(apiKey: _apiKey);
-      }
       notifyListeners();
+      if (_bibleApiKey.isNotEmpty) {
+        unawaited(_loadWelcomeVerse());
+      }
     } catch (e) {
       debugPrint('[VoiceSessionController] Error loading preferences: $e');
     }
@@ -131,17 +143,17 @@ class VoiceSessionController extends ChangeNotifier {
         role: MessageRole.assistant,
         content:
             "Grace and peace to you. I am your biblical companion powered by Gemini Live. Speak to me anytime to explore scripture, seek devotional guidance, or study deep theological passages together.",
-        scriptures: [
-          const ScriptureQuote(
-            reference: 'Psalm 119:105',
-            text: 'Your word is a lamp to my feet and a light to my path.',
-            translation: 'ESV',
-            contextNote: 'The enduring light of God’s guidance',
-          ),
-        ],
         isVoice: true,
       ),
     );
+  }
+
+  Future<void> _loadWelcomeVerse() async {
+    final result = await _bibleApi.lookup('Psalm 119:105');
+    final quote = result.quote;
+    if (quote == null || _messages.isEmpty) return;
+    _messages[0] = _messages.first.copyWith(scriptures: [quote]);
+    notifyListeners();
   }
 
   void _startFallbackAmplitudeTimer() {
@@ -168,11 +180,24 @@ class VoiceSessionController extends ChangeNotifier {
   // -------------------------------------------------------------
   Future<void> setApiKey(String key) async {
     _apiKey = key.trim();
-    _ttsService = GeminiTtsService(apiKey: _apiKey);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('gemini_api_key', _apiKey);
     _statusMessage = 'API Key saved';
     notifyListeners();
+  }
+
+  Future<void> setBibleApiKey(String key) async {
+    _bibleApiKey = key.trim();
+    _bibleApi.setApiKey(_bibleApiKey);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('api_bible_key', _bibleApiKey);
+    _statusMessage = _bibleApiKey.isEmpty
+        ? 'API.Bible key cleared'
+        : 'API.Bible key saved';
+    notifyListeners();
+    if (_bibleApiKey.isNotEmpty) {
+      unawaited(_loadWelcomeVerse());
+    }
   }
 
   Future<void> setVoice(String voice) async {
@@ -238,6 +263,7 @@ class VoiceSessionController extends ChangeNotifier {
 
     _audioManager.stopPlayback();
     _audioManager.stopRecording();
+    _resetAssistantHold();
 
     _state = VoiceSessionState.connecting;
     _statusMessage = 'Connecting to Gemini Live...';
@@ -270,9 +296,18 @@ class VoiceSessionController extends ChangeNotifier {
     };
 
     _liveClient!.onSetupComplete = () async {
-      _state = VoiceSessionState.listening;
-      _statusMessage = 'Listening \u2022 Speak your thought or question';
-      notifyListeners();
+      final pendingPrompt = _pendingLivePrompt;
+      _pendingLivePrompt = null;
+      if (pendingPrompt != null) {
+        _state = VoiceSessionState.thinking;
+        _statusMessage = 'Consulting Scripture & formulating voice...';
+        notifyListeners();
+        _liveClient?.sendText(pendingPrompt);
+      } else {
+        _state = VoiceSessionState.listening;
+        _statusMessage = 'Listening \u2022 Speak your thought or question';
+        notifyListeners();
+      }
 
       // Automatically activate microphone streaming
       final micStarted = await _audioManager.startRecording();
@@ -284,19 +319,21 @@ class VoiceSessionController extends ChangeNotifier {
     };
 
     _liveClient!.onAudioChunk = (pcm24kBytes) {
-      // Feed PCM to buffer — state stays thinking until turnComplete triggers playback
-      if (_state == VoiceSessionState.listening ||
+      final canSpeak =
+          _state == VoiceSessionState.listening ||
           _state == VoiceSessionState.thinking ||
-          _state == VoiceSessionState.connecting) {
-        _state = VoiceSessionState.thinking;
+          _state == VoiceSessionState.connecting;
+      if (canSpeak && _state != VoiceSessionState.speaking) {
+        _audioManager.stopRecording();
+        _state = VoiceSessionState.speaking;
+        _statusMessage = 'Speaking...';
+        _releaseHeldAssistantText();
+        notifyListeners();
       }
       _audioManager.feedPcmChunk(pcm24kBytes);
-      notifyListeners();
     };
 
-    _liveClient!.onTextDelta = (delta) {
-      _appendStreamingAssistantDelta(delta);
-    };
+    _liveClient!.onTextDelta = _holdOrAppendAssistant;
 
     _liveClient!.onInputTranscript = (userSpeech) {
       _appendUserTranscript(userSpeech);
@@ -308,21 +345,35 @@ class VoiceSessionController extends ChangeNotifier {
       }
     };
 
-    _liveClient!.onOutputTranscript = (modelSpeech) {
-      _appendStreamingAssistantDelta(modelSpeech);
-    };
+    _liveClient!.onOutputTranscript = _holdOrAppendAssistant;
+
+    _liveClient!.onToolCall = _handleToolCall;
 
     _liveClient!.onTurnComplete = () async {
-      debugPrint('[VoiceSessionController] Turn complete — playing audio turn');
-      _finalizeCurrentAssistantTurn();
-      _state = VoiceSessionState.speaking;
-      _statusMessage = 'Speaking...';
-      notifyListeners();
-      await _audioManager.playAccumulatedTurn();
+      debugPrint(
+        '[VoiceSessionController] Turn complete — voice keeps playing',
+      );
+      if (!_voiceHasStarted) {
+        _releaseHeldAssistantText();
+      }
+      await _finalizeCurrentAssistantTurn();
+      final waitingForPlayback = _audioManager.completeLiveTurn();
+      if (waitingForPlayback) return;
+
+      if (_state == VoiceSessionState.speaking ||
+          _state == VoiceSessionState.thinking) {
+        _state = VoiceSessionState.listening;
+        _statusMessage = 'Listening • Speak anytime to reply';
+        _audioAmplitude = 0.05;
+        _resetAssistantHold();
+        notifyListeners();
+        await _audioManager.startRecording();
+      }
     };
 
     _liveClient!.onInterrupted = () async {
       debugPrint('[VoiceSessionController] Gemini Live Interrupted by User');
+      _resetAssistantHold();
       await _audioManager.stopPlayback();
       _state = VoiceSessionState.listening;
       _statusMessage = 'Interrupted \u2022 Listening...';
@@ -353,6 +404,7 @@ class VoiceSessionController extends ChangeNotifier {
       model: _selectedModel,
       voiceName: _selectedVoice,
       systemInstruction: systemInstruction,
+      tools: BibleApiService.liveTools,
     );
 
     if (!ok) {
@@ -366,6 +418,8 @@ class VoiceSessionController extends ChangeNotifier {
     _state = VoiceSessionState.idle;
     _statusMessage = 'Session ended • Tap mic to converse';
     _audioAmplitude = 0.05;
+    _pendingLivePrompt = null;
+    _resetAssistantHold();
     _liveClient?.disconnect();
     _liveClient = null;
     _audioManager.stopRecording();
@@ -392,82 +446,76 @@ class VoiceSessionController extends ChangeNotifier {
   }
 
   // -------------------------------------------------------------
-  // TEXT PROMPT & SCRIPTURE TTS
+  // TEXT PROMPT & SCRIPTURE READING
   // -------------------------------------------------------------
-  Future<void> submitPrompt(String text) async {
-    final userMsg = ChatMessage(
-      id: 'msg_${DateTime.now().millisecondsSinceEpoch}',
-      role: MessageRole.user,
-      content: text,
-      isVoice: true,
-    );
-    _messages.add(userMsg);
+  Future<void> submitPrompt(String text, {String? chatText}) async {
+    if (_apiKey.trim().isEmpty) {
+      _state = VoiceSessionState.error;
+      _statusMessage = 'Please enter your Gemini API Key in Settings';
+      notifyListeners();
+      return;
+    }
 
+    _messages.add(
+      ChatMessage(
+        id: 'msg_${DateTime.now().millisecondsSinceEpoch}',
+        role: MessageRole.user,
+        content: chatText ?? text,
+        isVoice: true,
+      ),
+    );
     _state = VoiceSessionState.thinking;
     _statusMessage = 'Consulting Scripture & formulating voice...';
     notifyListeners();
+    await _dispatchLivePrompt(text);
+  }
 
-    // If live client is active, send directly through live WebSocket
+  /// Asks the live session to read a verse aloud.
+  Future<void> speakScripture(ScriptureQuote scripture) {
+    return submitPrompt(
+      'Read ${scripture.reference} aloud from the ${scripture.translation} translation, word for word, then stop. Verse text: "${scripture.text}"',
+      chatText: 'Read ${scripture.reference}',
+    );
+  }
+
+  Future<void> _dispatchLivePrompt(String text) async {
     if (_liveClient != null && _liveClient!.isConnected) {
       _liveClient!.sendText(text);
       return;
     }
 
-    // If not connected, start the live session or use Gemini TTS
-    if (_apiKey.isEmpty) {
-      _state = VoiceSessionState.error;
-      _statusMessage = 'Gemini API Key required to generate live voice';
-      notifyListeners();
-      return;
-    }
-
-    // Auto-connect live session and send
-    await startSession();
-    // Wait briefly for handshake then send
-    Timer(const Duration(milliseconds: 1000), () {
-      if (_liveClient != null && _liveClient!.isConnected) {
-        _liveClient!.sendText(text);
-      }
-    });
-  }
-
-  /// Synthesizes and speaks a specific Scripture verse on-demand using Gemini TTS
-  Future<void> speakScripture(ScriptureQuote scripture) async {
-    if (_apiKey.isEmpty) {
-      _statusMessage = 'Gemini API Key required for voice reading';
-      notifyListeners();
-      return;
-    }
-
-    _state = VoiceSessionState.thinking;
-    _statusMessage = 'Preparing vocal recitation of ${scripture.reference}...';
-    notifyListeners();
-
-    _ttsService ??= GeminiTtsService(apiKey: _apiKey);
-    final textToRead =
-        '${scripture.reference}. From the ${scripture.translation} translation: "${scripture.text}"';
-
-    final pcmBytes = await _ttsService!.synthesizeSpeech(
-      text: textToRead,
-      voiceName: _selectedVoice,
-      model: 'gemini-2.0-flash-live-001',
-    );
-
-    if (pcmBytes != null && pcmBytes.isNotEmpty) {
-      _state = VoiceSessionState.speaking;
-      _statusMessage = 'Reading ${scripture.reference}...';
-      notifyListeners();
-      await _audioManager.playPcmBytes(pcmBytes);
-    } else {
-      _state = VoiceSessionState.idle;
-      _statusMessage = 'Unable to synthesize audio. Check API key.';
-      notifyListeners();
+    _pendingLivePrompt = text;
+    if (!isActive) {
+      await startSession();
     }
   }
 
   // -------------------------------------------------------------
   // TRANSCRIPT & STREAMING HELPERS
   // -------------------------------------------------------------
+  void _holdOrAppendAssistant(String delta) {
+    if (delta.isEmpty) return;
+    if (!_voiceHasStarted) {
+      _heldAssistantText += delta;
+      return;
+    }
+    _appendStreamingAssistantDelta(delta);
+  }
+
+  void _releaseHeldAssistantText() {
+    _voiceHasStarted = true;
+    final held = _heldAssistantText;
+    _heldAssistantText = '';
+    if (held.isNotEmpty) {
+      _appendStreamingAssistantDelta(held);
+    }
+  }
+
+  void _resetAssistantHold() {
+    _voiceHasStarted = false;
+    _heldAssistantText = '';
+  }
+
   void _appendStreamingAssistantDelta(String delta) {
     if (delta.isEmpty) return;
 
@@ -517,18 +565,94 @@ class VoiceSessionController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _finalizeCurrentAssistantTurn() {
+  Future<void> _handleToolCall(Map<String, dynamic> toolCall) async {
+    final calls = toolCall['functionCalls'] as List? ?? const [];
+    for (final call in calls) {
+      if (call is! Map) continue;
+      final name = call['name'] as String? ?? '';
+      final id = call['id'] as String? ?? '';
+      if (name != 'lookup_bible_passage') continue;
+
+      final args = call['args'];
+      final reference = args is Map
+          ? args['reference']?.toString() ?? ''
+          : '';
+      final result = await _bibleApi.lookup(reference);
+      final quote = result.quote;
+      if (quote != null) {
+        _attachScripture(quote);
+        _liveClient?.sendToolResponse(
+          id: id,
+          name: name,
+          response: {
+            'reference': quote.reference,
+            'translation': 'NIV',
+            'text': quote.text,
+            'result':
+                '${quote.reference} (NIV): ${quote.text}. Read this wording verbatim.',
+          },
+        );
+      } else {
+        _liveClient?.sendToolResponse(
+          id: id,
+          name: name,
+          response: {
+            'error': result.error ?? 'Passage not found.',
+            'result': result.error ?? 'Passage not found.',
+          },
+        );
+      }
+    }
+  }
+
+  void _attachScripture(ScriptureQuote quote) {
+    _releaseHeldAssistantText();
     if (_messages.isNotEmpty && _messages.last.isAssistant) {
-      final finalContent = _messages.last.content;
-      final parsedScriptures = ScriptureParser.parseScriptures(
-        finalContent,
-        defaultTranslation: _selectedTranslation,
-      );
+      final existing = _messages.last.scriptures;
+      if (existing.any(
+        (item) => BibleReference.samePassage(item.reference, quote.reference),
+      )) {
+        return;
+      }
       _messages[_messages.length - 1] = _messages.last.copyWith(
-        scriptures: parsedScriptures,
-        isStreaming: false,
+        scriptures: [...existing, quote],
+      );
+    } else {
+      _voiceHasStarted = true;
+      _messages.add(
+        ChatMessage(
+          id: 'msg_${DateTime.now().millisecondsSinceEpoch}',
+          role: MessageRole.assistant,
+          content: '',
+          scriptures: [quote],
+          isVoice: true,
+          isStreaming: true,
+        ),
       );
     }
+    notifyListeners();
+  }
+
+  Future<void> _finalizeCurrentAssistantTurn() async {
+    if (_messages.isEmpty || !_messages.last.isAssistant) return;
+
+    final message = _messages.last;
+    final scriptures = [...message.scriptures];
+    for (final reference in ScriptureParser.extractReferences(message.content)) {
+      if (scriptures.any(
+        (item) => BibleReference.samePassage(item.reference, reference),
+      )) {
+        continue;
+      }
+      final result = await _bibleApi.lookup(reference);
+      final quote = result.quote;
+      if (quote != null) scriptures.add(quote);
+    }
+
+    _messages[_messages.length - 1] = message.copyWith(
+      scriptures: scriptures,
+      isStreaming: false,
+    );
     notifyListeners();
   }
 
@@ -538,13 +662,14 @@ You are "Scripture Live", an empathetic, profound, and reverent biblical AI comp
 You are speaking directly to the user through real-time audio voice.
 
 Current Persona: $_selectedPersona
-Preferred Bible Translation: $_selectedTranslation
+Licensed Bible text: New International Version (NIV), retrieved with lookup_bible_passage.
 
 Guidelines:
 1. Speak in a warm, contemplative, and engaging tone suitable for spoken conversation.
-2. Quote scripture verbatim using the $_selectedTranslation translation whenever citing God's Word. Always state the Book, Chapter, and Verse reference clearly (e.g. "In Romans 8:28, the apostle Paul writes...").
-3. Keep spoken replies concise, impactful, and conversational (usually 2 to 4 sentences unless asked for an in-depth exposition).
-4. Address user questions about grief, joy, anxiety, doubt, theology, prayer, and daily Christian living with Christ-centered encouragement, historical depth, and hope.
+2. Before you quote, read, or cite any Bible passage, call lookup_bible_passage with the reference. Speak the returned NIV text verbatim. Never invent, paraphrase, or recall verse wording from memory.
+3. Say the reference clearly, then read the verse, for example "In John 3:16, the New International Version says...".
+4. Keep spoken replies concise, impactful, and conversational (usually 2 to 4 sentences unless asked for an in-depth exposition).
+5. Address user questions about grief, joy, anxiety, doubt, theology, prayer, and daily Christian living with Christ-centered encouragement, historical depth, and hope.
 ''';
   }
 

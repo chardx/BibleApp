@@ -77,6 +77,7 @@ class _BibleVoiceScreenState extends State<BibleVoiceScreen> {
                           _controller.state == VoiceSessionState.thinking,
                       onScriptureSpeak: (scripture) =>
                           _controller.speakScripture(scripture),
+                      geminiApiKey: _controller.apiKey,
                     ),
                   ),
 

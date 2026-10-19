@@ -3,17 +3,21 @@ import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../models/scripture.dart';
 import '../theme/app_theme.dart';
+import 'scripture_focus_view.dart';
+import 'verse_image_dialog.dart';
 
 class ScriptureCard extends StatefulWidget {
   final ScriptureQuote scripture;
   final VoidCallback? onChapterTap;
   final VoidCallback? onSpeakTap;
+  final String geminiApiKey;
 
   const ScriptureCard({
     super.key,
     required this.scripture,
     this.onChapterTap,
     this.onSpeakTap,
+    this.geminiApiKey = '',
   });
 
   @override
@@ -128,6 +132,23 @@ class _ScriptureCardState extends State<ScriptureCard> {
                       // Actions: Listen, Bookmark, Copy
                       Row(
                         children: [
+                          IconButton(
+                            icon: const Icon(
+                              Icons.open_in_full,
+                              size: 18,
+                              color: AppTheme.brightGold,
+                            ),
+                            onPressed: () => ScriptureFocusView.open(
+                              context,
+                              scripture,
+                              onSpeak: widget.onSpeakTap,
+                              geminiApiKey: widget.geminiApiKey,
+                            ),
+                            tooltip: 'Read full passage',
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(),
+                          ),
+                          const SizedBox(width: 12),
                           if (widget.onSpeakTap != null) ...[
                             IconButton(
                               icon: const Icon(
@@ -222,6 +243,24 @@ class _ScriptureCardState extends State<ScriptureCard> {
                     ),
                   ),
 
+                  const SizedBox(height: 14),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      onPressed: () => VerseImageDialog.show(
+                        context,
+                        scripture: scripture,
+                        apiKey: widget.geminiApiKey,
+                      ),
+                      icon: const Icon(Icons.palette_outlined, size: 18),
+                      label: const Text('Illustrate verse'),
+                      style: TextButton.styleFrom(
+                        foregroundColor: AppTheme.brightGold,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                      ),
+                    ),
+                  ),
+
                   // Context note if present
                   if (scripture.contextNote != null &&
                       scripture.contextNote!.isNotEmpty) ...[
@@ -245,6 +284,21 @@ class _ScriptureCardState extends State<ScriptureCard> {
                           ),
                         ),
                       ],
+                    ),
+                  ],
+
+                  if (scripture.copyright != null &&
+                      scripture.copyright!.isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      scripture.copyright!,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: GoogleFonts.plusJakartaSans(
+                        color: AppTheme.textMuted,
+                        fontSize: 10,
+                        height: 1.35,
+                      ),
                     ),
                   ],
                 ],

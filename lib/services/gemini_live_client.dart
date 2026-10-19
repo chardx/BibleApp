@@ -16,6 +16,11 @@ class GeminiLiveClient {
   // _isDisconnecting prevents onClose from firing when WE initiated the close
   bool _isDisconnecting = false;
 
+  // Audio sent before setupComplete is dropped by the server.
+  bool _setupReady = false;
+  int _audioChunksSent = 0;
+  DateTime? _lastAudioLogAt;
+
   String _status = 'disconnected'; // 'disconnected', 'connecting', 'connected'
   String? _model;
   Map<String, dynamic>? _config;
@@ -46,6 +51,7 @@ class GeminiLiveClient {
     required String model,
     required String voiceName,
     required String systemInstruction,
+    List<Map<String, dynamic>>? tools,
   }) async {
     if (_status != 'disconnected') {
       debugPrint('[GeminiLiveClient] Already connecting/connected — aborting stale session first.');
@@ -54,6 +60,9 @@ class GeminiLiveClient {
 
     _status = 'connecting';
     _isDisconnecting = false;
+    _setupReady = false;
+    _audioChunksSent = 0;
+    _lastAudioLogAt = null;
     _model = model;
 
     // Ensure model name includes 'models/' prefix
@@ -114,6 +123,7 @@ class GeminiLiveClient {
               {'text': systemInstruction},
             ],
           },
+          if (tools != null && tools.isNotEmpty) 'tools': tools,
         },
       };
 
@@ -144,9 +154,16 @@ class GeminiLiveClient {
 
       debugPrint('[GeminiLiveClient] Received message keys: ${message.keys.toList()}');
 
+      if (message.containsKey('error')) {
+        debugPrint('[GeminiLiveClient] Server error: ${message['error']}');
+        onError?.call(message['error']);
+        return;
+      }
+
       // 1. Setup Complete
       if (message.containsKey('setupComplete')) {
         debugPrint('[GeminiLiveClient] ✓ Setup acknowledged by Gemini server');
+        _setupReady = true;
         onSetupComplete?.call();
         return;
       }
@@ -234,24 +251,37 @@ class GeminiLiveClient {
     }
   }
 
+  /// Live API audio frame. `mediaChunks` is ignored by current models, so the
+  /// server stays silent even though the socket and microphone are up.
+  static Map<String, dynamic> buildRealtimeAudioPayload(Uint8List pcm16kBytes) {
+    return {
+      'realtimeInput': {
+        'audio': {
+          'mimeType': 'audio/pcm;rate=16000',
+          'data': base64Encode(pcm16kBytes),
+        },
+      },
+    };
+  }
+
   /// Sends real-time microphone audio chunk (Linear PCM 16-bit 16kHz mono)
   void sendRealtimeAudio(Uint8List pcm16kBytes) {
-    if (_channel == null || _status != 'connected') return;
+    if (_channel == null || _status != 'connected' || !_setupReady) return;
+    if (pcm16kBytes.isEmpty) return;
 
     try {
-      final base64Data = base64Encode(pcm16kBytes);
-      final payload = {
-        'realtimeInput': {
-          'mediaChunks': [
-            {
-              'mimeType': 'audio/pcm;rate=16000',
-              'data': base64Data,
-            },
-          ],
-        },
-      };
-
-      _channel!.sink.add(jsonEncode(payload));
+      _channel!.sink.add(jsonEncode(buildRealtimeAudioPayload(pcm16kBytes)));
+      _audioChunksSent++;
+      final now = DateTime.now();
+      if (_audioChunksSent == 1 ||
+          _lastAudioLogAt == null ||
+          now.difference(_lastAudioLogAt!) >= const Duration(seconds: 2)) {
+        _lastAudioLogAt = now;
+        debugPrint(
+          '[GeminiLiveClient] Sent $_audioChunksSent mic chunks '
+          '(${pcm16kBytes.length} bytes latest)',
+        );
+      }
     } catch (e) {
       debugPrint('[GeminiLiveClient] Error sending audio chunk: $e');
     }
@@ -297,10 +327,11 @@ class GeminiLiveClient {
     final payload = {
       'toolResponse': {
         'functionResponses': [
-          {
-            'response': response,
-            'id': id,
-          },
+        {
+          'id': id,
+          'name': name,
+          'response': response,
+        },
         ],
       },
     };
@@ -319,8 +350,18 @@ class GeminiLiveClient {
   void _forceClose() {
     _subscription?.cancel();
     _subscription = null;
-    _channel?.sink.close(ws_status.goingAway);
+    final channel = _channel;
     _channel = null;
     _status = 'disconnected';
+    _setupReady = false;
+    if (channel == null) return;
+
+    try {
+      // The IO WebSocket adapter only accepts 1000 or 3000-4999.
+      // goingAway (1001) throws and crashes the session teardown.
+      channel.sink.close(ws_status.normalClosure);
+    } catch (e) {
+      debugPrint('[GeminiLiveClient] WebSocket close error: $e');
+    }
   }
 }

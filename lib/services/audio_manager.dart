@@ -1,12 +1,12 @@
 import 'dart:async';
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter_soloud/flutter_soloud.dart';
 import 'package:record/record.dart';
 
 /// AudioManager handles both live microphone streaming (16kHz PCM)
-/// and real-time audio playback (24kHz PCM to WAV conversion).
+/// and real-time audio playback (24kHz PCM).
 class AudioManager {
   final AudioPlayer _player = AudioPlayer();
   final AudioRecorder _recorder = AudioRecorder();
@@ -16,8 +16,17 @@ class AudioManager {
   bool _isPlaying = false;
   bool _isSpeakerOn = true;
 
-  // Buffer for incoming turn PCM chunks
-  final BytesBuilder _turnPcmBuffer = BytesBuilder(copy: false);
+  // Live Gemini voice. Chunks are played as they arrive instead of waiting
+  // for the whole turn to finish.
+  Future<void> _audioOps = Future<void>.value();
+  AudioSource? _liveSource;
+  SoundHandle? _liveHandle;
+  StreamSubscription<void>? _liveEndSub;
+  bool _turnOpen = false;
+  bool _generationEnded = false;
+  bool _liveFinished = false;
+  bool _suppressComplete = false;
+  bool _engineStarted = false;
 
   // Callbacks
   void Function(Uint8List chunk)? onMicChunk;
@@ -35,9 +44,9 @@ class AudioManager {
 
   void _initPlayerListeners() {
     _player.onPlayerStateChanged.listen((state) {
+      if (_turnOpen) return;
       _isPlaying = (state == PlayerState.playing);
       if (state == PlayerState.completed) {
-        _turnPcmBuffer.clear();
         onOutputAmplitude?.call(0.05);
         onPlaybackComplete?.call();
       }
@@ -107,50 +116,37 @@ class AudioManager {
   // -------------------------------------------------------------
   // AUDIO PLAYBACK (OUTPUT)
   // -------------------------------------------------------------
-  /// Ingests an incoming 24kHz PCM chunk from Gemini Live.
-  /// Accumulates chunks and calculates amplitude for the visualizer.
+  /// Plays an incoming 24kHz PCM chunk as soon as it arrives.
+  /// Returns control immediately; playback is queued in order.
   void feedPcmChunk(Uint8List pcm24kBytes) {
-    if (pcm24kBytes.isEmpty) return;
+    if (pcm24kBytes.length < 2) return;
 
-    _turnPcmBuffer.add(pcm24kBytes);
-
-    // Calculate real-time amplitude of chunk for wave visualizer
-    final amp = calculatePcmAmplitude(pcm24kBytes);
-    onOutputAmplitude?.call(amp);
+    final evenLength = pcm24kBytes.length - (pcm24kBytes.length % 2);
+    final chunk = Uint8List.fromList(pcm24kBytes.sublist(0, evenLength));
+    _turnOpen = true;
+    onOutputAmplitude?.call(calculatePcmAmplitude(chunk));
+    _enqueue(() => _pushLivePcm(chunk));
   }
 
-  /// Plays the accumulated 24kHz PCM audio buffer as a WAV stream.
-  /// IMPORTANT: Stops mic recording first to prevent audio feedback.
-  Future<void> playAccumulatedTurn() async {
-    // Stop mic to prevent echo feedback during playback
-    await stopRecording();
+  /// Marks the model's audio generation as finished.
+  /// Playback continues through audio already received.
+  /// Returns true when a spoken turn is still draining.
+  bool completeLiveTurn() {
+    if (!_turnOpen) return false;
+    _generationEnded = true;
+    _enqueue(() async {
+      final source = _liveSource;
+      if (source == null) return;
 
-    final accumulatedBytes = _turnPcmBuffer.takeBytes();
-    if (accumulatedBytes.isEmpty) {
-      debugPrint('[AudioManager] playAccumulatedTurn: buffer empty, nothing to play');
-      onPlaybackComplete?.call();
-      return;
-    }
-
-    final wavBytes = pcmToWav(
-      accumulatedBytes,
-      sampleRate: 24000,
-      channels: 1,
-      bitsPerSample: 16,
-    );
-
-    try {
-      await _player.setVolume(_isSpeakerOn ? 1.0 : 0.0);
-      await _player.stop();
-      await _player.play(BytesSource(wavBytes));
-      _isPlaying = true;
-      debugPrint('[AudioManager] Playing Gemini Live audio turn (${accumulatedBytes.length} PCM bytes → ${wavBytes.length} WAV bytes)');
-    } catch (e) {
-      debugPrint('[AudioManager] Error playing turn audio: $e');
-      _isPlaying = false;
-      onOutputAmplitude?.call(0.05);
-      onPlaybackComplete?.call();
-    }
+      SoLoud.instance.setDataIsEnded(source);
+      final handle = _liveHandle;
+      final alive =
+          handle != null && SoLoud.instance.getIsValidVoiceHandle(handle);
+      if (!alive) {
+        _finishLivePlayback();
+      }
+    });
+    return true;
   }
 
   /// Plays arbitrary 24kHz PCM bytes directly (e.g. from TTS)
@@ -180,20 +176,146 @@ class AudioManager {
     }
   }
 
-  /// Stops current playback immediately and wipes audio queue (Barge-in / Interrupt)
-  Future<void> stopPlayback() async {
-    _turnPcmBuffer.clear();
-    try {
-      await _player.stop();
-    } catch (_) {}
-    _isPlaying = false;
-    onOutputAmplitude?.call(0.05);
+  /// Stops current playback immediately and wipes the live audio queue.
+  Future<void> stopPlayback() {
+    _suppressComplete = true;
+    final done = Completer<void>();
+    _enqueue(() async {
+      try {
+        try {
+          await _player.stop();
+        } catch (_) {}
+        await _tearDownLive();
+      } finally {
+        _suppressComplete = false;
+        if (!done.isCompleted) done.complete();
+      }
+    });
     debugPrint('[AudioManager] Playback stopped & buffer cleared (Interrupted)');
+    return done.future;
   }
 
   void setSpeaker(bool enabled) {
     _isSpeakerOn = enabled;
     _player.setVolume(enabled ? 1.0 : 0.0);
+    if (!_engineStarted) return;
+    final handle = _liveHandle;
+    if (handle != null && SoLoud.instance.getIsValidVoiceHandle(handle)) {
+      SoLoud.instance.setVolume(handle, enabled ? 1 : 0);
+    }
+  }
+
+  void _enqueue(Future<void> Function() action) {
+    _audioOps = _audioOps.then((_) => action()).catchError((
+      Object error,
+      StackTrace stack,
+    ) {
+      debugPrint('[AudioManager] Live playback error: $error\n$stack');
+      if (!_suppressComplete) {
+        _finishLivePlayback();
+      }
+    });
+  }
+
+  Future<void> _ensureEngine() async {
+    if (_engineStarted) return;
+    await SoLoud.instance.init(
+      sampleRate: 48000,
+      bufferSize: 1024,
+      channels: Channels.stereo,
+    );
+    _engineStarted = true;
+  }
+
+  Future<void> _pushLivePcm(Uint8List pcm) async {
+    await _ensureEngine();
+    final source = _liveSource ??= _openLiveSource();
+    SoLoud.instance.addAudioDataStream(source, pcm);
+
+    final handle = _liveHandle;
+    final alive =
+        handle != null && SoLoud.instance.getIsValidVoiceHandle(handle);
+    if (alive) return;
+
+    _liveHandle = SoLoud.instance.play(
+      source,
+      volume: _isSpeakerOn ? 1 : 0,
+    );
+    _isPlaying = true;
+    debugPrint('[AudioManager] Live voice playing (24kHz PCM stream)');
+  }
+
+  AudioSource _openLiveSource() {
+    _liveFinished = false;
+    final source = SoLoud.instance.setBufferStream(
+      maxBufferSizeDuration: const Duration(minutes: 2),
+      bufferingType: BufferingType.released,
+      bufferingTimeNeeds: 0.08,
+      sampleRate: 24000,
+      channels: Channels.mono,
+      format: BufferType.s16le,
+    );
+    _liveEndSub = source.allInstancesFinished.listen((_) {
+      if (_suppressComplete || !identical(_liveSource, source)) return;
+      if (!_generationEnded) {
+        _liveHandle = null;
+        _isPlaying = false;
+        return;
+      }
+      _finishLivePlayback();
+    });
+    return source;
+  }
+
+  void _finishLivePlayback() {
+    if (_liveFinished) return;
+    _liveFinished = true;
+    _isPlaying = false;
+    _turnOpen = false;
+    _generationEnded = false;
+    final subscription = _liveEndSub;
+    _liveEndSub = null;
+    subscription?.cancel();
+    final source = _liveSource;
+    _liveSource = null;
+    _liveHandle = null;
+    if (source != null && _engineStarted) {
+      unawaited(
+        SoLoud.instance.disposeSource(source).catchError((Object _) {}),
+      );
+    }
+    onOutputAmplitude?.call(0.05);
+    if (!_suppressComplete) {
+      onPlaybackComplete?.call();
+    }
+  }
+
+  Future<void> _tearDownLive() async {
+    _liveFinished = true;
+    _turnOpen = false;
+    _generationEnded = false;
+    _isPlaying = false;
+    final subscription = _liveEndSub;
+    _liveEndSub = null;
+    await subscription?.cancel();
+    final handle = _liveHandle;
+    final source = _liveSource;
+    _liveHandle = null;
+    _liveSource = null;
+    if (_engineStarted) {
+      if (handle != null && SoLoud.instance.getIsValidVoiceHandle(handle)) {
+        await SoLoud.instance.stop(handle);
+      }
+      if (source != null) {
+        try {
+          await SoLoud.instance.disposeSource(source);
+        } catch (e) {
+          debugPrint('[AudioManager] dispose stream failed: $e');
+        }
+      }
+    }
+    onOutputAmplitude?.call(0.05);
+    _liveFinished = false;
   }
 
   // -------------------------------------------------------------
@@ -269,8 +391,11 @@ class AudioManager {
 
   void dispose() {
     stopRecording();
-    stopPlayback();
+    unawaited(stopPlayback());
     _player.dispose();
     _recorder.dispose();
+    if (_engineStarted) {
+      SoLoud.instance.deinit();
+    }
   }
 }

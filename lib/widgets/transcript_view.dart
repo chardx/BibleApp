@@ -9,12 +9,14 @@ class TranscriptView extends StatefulWidget {
   final List<ChatMessage> messages;
   final bool isThinking;
   final void Function(ScriptureQuote scripture)? onScriptureSpeak;
+  final String geminiApiKey;
 
   const TranscriptView({
     super.key,
     required this.messages,
     this.isThinking = false,
     this.onScriptureSpeak,
+    this.geminiApiKey = '',
   });
 
   @override
@@ -178,8 +180,8 @@ class _TranscriptViewState extends State<TranscriptView> {
             ),
             const SizedBox(height: 8),
 
-            // Message text bubble
-            Container(
+            if (message.content.trim().isNotEmpty)
+              Container(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
               decoration: BoxDecoration(
                 color: AppTheme.surfaceCard,
@@ -210,6 +212,7 @@ class _TranscriptViewState extends State<TranscriptView> {
               ...message.scriptures.map(
                 (scripture) => ScriptureCard(
                   scripture: scripture,
+                  geminiApiKey: widget.geminiApiKey,
                   onSpeakTap: widget.onScriptureSpeak != null
                       ? () => widget.onScriptureSpeak!(scripture)
                       : null,

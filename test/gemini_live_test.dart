@@ -1,6 +1,8 @@
+import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:bible_app/services/audio_manager.dart';
+import 'package:bible_app/services/gemini_live_client.dart';
 import 'package:bible_app/services/scripture_parser.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -61,6 +63,19 @@ void main() {
         loudBytes.buffer.asUint8List(),
       );
       expect(loudAmp, greaterThan(0.5));
+    });
+  });
+
+  group('GeminiLiveClient audio frames', () {
+    test('sends microphone PCM as a realtime audio blob', () {
+      final pcm = Uint8List.fromList([0x00, 0x00, 0xFF, 0x7F]);
+      final payload = GeminiLiveClient.buildRealtimeAudioPayload(pcm);
+      final realtime = payload['realtimeInput'] as Map<String, dynamic>;
+
+      expect(realtime.containsKey('mediaChunks'), isFalse);
+      final audio = realtime['audio'] as Map<String, dynamic>;
+      expect(audio['mimeType'], equals('audio/pcm;rate=16000'));
+      expect(audio['data'], equals(base64Encode(pcm)));
     });
   });
 

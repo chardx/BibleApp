@@ -7,6 +7,20 @@ class ScriptureParser {
     caseSensitive: false,
   );
 
+  /// References mentioned in [content], in order, without invented verse text.
+  static List<String> extractReferences(String content) {
+    final results = <String>[];
+    final seen = <String>{};
+    for (final match in _bibleRefRegex.allMatches(content)) {
+      final ref = match.group(0)?.trim() ?? '';
+      final key = ref.toLowerCase();
+      if (ref.isEmpty || seen.contains(key)) continue;
+      seen.add(key);
+      results.add(ref);
+    }
+    return results;
+  }
+
   /// Scans text for scripture references and attempts to extract quote excerpts.
   static List<ScriptureQuote> parseScriptures(String content, {String defaultTranslation = 'ESV'}) {
     final List<ScriptureQuote> results = [];
